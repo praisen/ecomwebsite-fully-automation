@@ -41,11 +41,11 @@ pipeline {
             }
         }
         
-        stage('4. Install npm') {
-            steps {
-                sh "npm install"
-            }
-        }
+// stage('4. Install npm') {
+//     steps {
+//         sh "npm install"
+//     }
+// }
         
         stage('5. Trivy Scan') {
             steps {
