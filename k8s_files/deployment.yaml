@@ -1,23 +1,21 @@
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pandacloud-app
+  name: ecowordlylife
   labels:
-    app: pandacloud-app
+    app: ecowordlylife
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pandacloud-app
+      app: ecowordlylife
   template:
     metadata:
       labels:
-        app: pandacloud-app
+        app: ecowordlylife
     spec:
       containers:
-      - name: pandacloud-container
-        image: 309395755719.dkr.ecr.us-east-1.amazonaws.com/amazon-prime:latest
+      - name: ecowordlylife-container
+        image: 309395755719.dkr.ecr.us-east-1.amazonaws.com/ecowordlylife:latest
         ports:
         - containerPort: 3000
-...
