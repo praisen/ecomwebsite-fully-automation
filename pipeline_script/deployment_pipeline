@@ -3,58 +3,132 @@ pipeline {
 
     environment {
         KUBECTL = '/usr/local/bin/kubectl'
+        MONITORING_NS = 'ecowordlylife-monitoring'
+        ARGOCD_NS = 'ecowordlylife-gitops'
     }
 
     parameters {
-        string(name: 'CLUSTER_NAME', defaultValue: 'amazon-prime-cluster', description: 'Enter your EKS cluster name')
+        string(name: 'CLUSTER_NAME', defaultValue: 'ecowordlylife-cluster', description: 'EKS cluster name')
+        string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'AWS region')
     }
 
     stages {
         stage("Login to EKS") {
             steps {
                 script {
-                    withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'),
-                                     string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
-                        sh "aws eks --region us-east-1 update-kubeconfig --name ${params.CLUSTER_NAME}"
+                    withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+                                      secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                        sh """
+                        aws eks --region ${params.AWS_REGION} update-kubeconfig \
+                          --name ${params.CLUSTER_NAME} \
+                          --alias ecowordlylife
+                        """
                     }
                 }
             }
         }
 
-        stage("Configure Prometheus & Grafana") {
+        stage("Deploy Monitoring Stack") {
             steps {
                 script {
                     sh """
-                    helm repo add stable https://charts.helm.sh/stable || true
-                    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
-                    # Check if namespace 'prometheus' exists
-                    if kubectl get namespace prometheus > /dev/null 2>&1; then
-                        # If namespace exists, upgrade the Helm release
-                        helm upgrade stable prometheus-community/kube-prometheus-stack -n prometheus
-                    else
-                        # If namespace does not exist, create it and install Helm release
-                        kubectl create namespace prometheus
-                        helm install stable prometheus-community/kube-prometheus-stack -n prometheus
-                    fi
-                    kubectl patch svc stable-kube-prometheus-sta-prometheus -n prometheus -p '{"spec": {"type": "LoadBalancer"}}'
-                    kubectl patch svc stable-grafana -n prometheus -p '{"spec": {"type": "LoadBalancer"}}'
+                    # Add modern Helm repos
+                    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                    helm repo add grafana https://grafana.github.io/helm-charts
+                    helm repo update
+
+                    # Create dedicated monitoring namespace
+                    kubectl create namespace ${MONITORING_NS} --dry-run=client -o yaml | kubectl apply -f -
+
+                    # Install Prometheus with WordPress optimization
+                    helm upgrade --install ecowordlylife-prometheus prometheus-community/kube-prometheus-stack \
+                      -n ${MONITORING_NS} \
+                      --set prometheus.prometheusSpec.retentionSize="10Gi" \
+                      --set grafana.sidecar.dashboards.enabled=true \
+                      --set grafana.sidecar.dashboards.label="grafana_dashboard-ecowordlylife"
+
+                    # Configure WordPress-specific monitoring
+                    kubectl apply -n ${MONITORING_NS} -f - <<EOF
+                    apiVersion: monitoring.coreos.com/v1
+                    kind: ServiceMonitor
+                    metadata:
+                      name: ecowordlylife-wordpress
+                    spec:
+                      selector:
+                        matchLabels:
+                          app: ecowordlylife
+                      endpoints:
+                      - port: http
+                        path: /metrics
+                    EOF
+
+                    # Expose monitoring services
+                    kubectl patch svc ecowordlylife-prometheus-grafana -n ${MONITORING_NS} \
+                      -p '{"spec": {"type": "LoadBalancer"}}'
                     """
                 }
             }
         }
 
-        stage("Configure ArgoCD") {
+        stage("Setup GitOps with ArgoCD") {
             steps {
                 script {
                     sh """
-                    # Install ArgoCD
-                    kubectl create namespace argocd || true
-                    kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-                    kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+                    # Install ArgoCD in dedicated namespace
+                    kubectl create namespace ${ARGOCD_NS} --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl apply -n ${ARGOCD_NS} -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+                    # Configure WordPress application
+                    kubectl apply -n ${ARGOCD_NS} -f - <<EOF
+                    apiVersion: argoproj.io/v1alpha1
+                    kind: Application
+                    metadata:
+                      name: ecowordlylife
+                    spec:
+                      project: default
+                      source:
+                        repoURL: 'https://github.com/your-org/ecowordlylife-gitops.git'
+                        path: kubernetes
+                        targetRevision: HEAD
+                      destination:
+                        server: 'https://kubernetes.default.svc'
+                        namespace: default
+                      syncPolicy:
+                        automated:
+                          selfHeal: true
+                          prune: true
+                    EOF
+
+                    # Expose ArgoCD dashboard
+                    kubectl patch svc argocd-server -n ${ARGOCD_NS} \
+                      -p '{"spec": {"type": "LoadBalancer"}}'
                     """
                 }
             }
         }
-		
+    }
+
+    post {
+        always {
+            script {
+                // Get monitoring credentials
+                sh """
+                kubectl get secret -n ${MONITORING_NS} ecowordlylife-prometheus-grafana \
+                  -o jsonpath='{.data.admin-password}' | base64 -d > grafana-credentials.txt
+                
+                echo "ArgoCD Admin Password:"
+                kubectl get secret -n ${ARGOCD_NS} argocd-initial-admin-secret \
+                  -o jsonpath='{.data.password}' | base64 -d
+                """
+                
+                archiveArtifacts artifacts: 'grafana-credentials.txt'
+            }
+        }
+        
+        success {
+            slackSend channel: '#deployments',
+                     color: 'good',
+                     message: "ecowordlylife monitoring deployed successfully! Cluster: ${params.CLUSTER_NAME}"
+        }
     }
 }
